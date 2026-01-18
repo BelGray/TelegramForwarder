@@ -28,6 +28,3 @@ CREATE TABLE IF NOT EXISTS history (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (account_id) REFERENCES accounts(id)
 );
-
-INSERT INTO sources (channel_link) VALUES ('rentvseyabali');
-INSERT INTO destinations (chat_link) VALUES ('balibike_sic'), ('balimotorbikes'), ('balibikefamaly');
