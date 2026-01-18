@@ -43,6 +43,7 @@ async def show_lists():
 
 
 async def add_source():
+    print("Если вы добавили новый ИСТОЧНИК (откуда брать сообщения), перезапустите бота, чтобы он учёл изменения.")
     link = input("Введите ссылку или юзернейм источника: ")
     clean = clean_link(link)
     await execute_query("INSERT IGNORE INTO sources (channel_link) VALUES (%s)", (clean,))
@@ -50,6 +51,7 @@ async def add_source():
 
 
 async def add_dest():
+    print("Если добавили ПОЛУЧАТЕЛЯ (куда пересылать сообщения) — перезапускать бота не нужно, он подхватит изменения сам.")
     link = input("Введите ссылку или юзернейм получателя: ")
     clean = clean_link(link)
     await execute_query("INSERT IGNORE INTO destinations (chat_link) VALUES (%s)", (clean,))
