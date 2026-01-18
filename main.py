@@ -167,6 +167,11 @@ async def main():
                     try:
                         logger.info(f"Trying to send via {sender.phone_number}...")
 
+                        try:
+                            await sender.join_chat(dest)
+                        except Exception:
+                            logger.debug(f"Join chat warning: {e}")
+
                         await sender.forward_messages(
                             chat_id=dest,
                             from_chat_id=message.chat.id,

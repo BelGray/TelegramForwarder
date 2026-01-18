@@ -119,6 +119,12 @@ async def start_sender():
                 break
 
             try:
+
+                try:
+                    await sender.join_chat(dest)
+                except Exception:
+                    pass
+
                 await sender.forward_messages(
                     chat_id=dest,
                     from_chat_id=chat_username,
