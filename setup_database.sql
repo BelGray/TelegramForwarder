@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS sources (
 -- Таблица получателей
 CREATE TABLE IF NOT EXISTS destinations (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    chat_link VARCHAR(100) NOT NULL UNIQUE
+    chat_link VARCHAR(100) NOT NULL UNIQUE,
+    last_ad_msg_id INT DEFAULT NULL;
 );
 
 -- История
