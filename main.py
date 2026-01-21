@@ -4,7 +4,7 @@ from pyrogram import Client, filters, compose
 import aiomysql
 from pyrogram.errors import FloodWait, UserDeactivated, AuthKeyUnregistered
 
-from env_loader import DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, API_ID, API_HASH
+from env_loader import DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, API_ID, API_HASH, ADMIN_ID
 from log_config import logger
 
 DB_CONFIG = {
@@ -138,6 +138,67 @@ async def main():
         clients.append(app)
 
     for app in clients:
+
+        @app.on_message(filters.command("help") & filters.user(ADMIN_ID))
+        async def help_cmd(client, message):
+            text = (
+                "**ADMIN COMMANDS:**\n\n"
+                "1️⃣ **Add Source** (From where):\n"
+                "`/add_source @link`\n\n"
+                "2️⃣ **Add Destination** (Where to):\n"
+                "`/add_dest @link`\n\n"
+                "3️⃣ **Show Lists:**\n"
+                "`/list`\n\n"
+                "ℹ️ *Restart bot after adding a new source.*"
+            )
+            await message.reply(text)
+
+        @app.on_message(filters.command("add_source") & filters.user(ADMIN_ID))
+        async def add_source_cmd(client, message):
+            try:
+                link = message.command[1]
+                clean = link.replace("https://t.me/", "").replace("@", "").strip()
+
+                conn = await aiomysql.connect(**DB_CONFIG)
+                async with conn.cursor() as cur:
+                    await cur.execute("INSERT IGNORE INTO sources (channel_link) VALUES (%s)", (clean,))
+                    await conn.commit()
+                conn.close()
+
+                await message.reply(f"✅ Source **{clean}** added! Restart bot to apply.")
+            except IndexError:
+                await message.reply("❌ Error. Usage: `/add_source @link`")
+            except Exception as e:
+                await message.reply(f"❌ DB Error: {e}")
+
+        @app.on_message(filters.command("add_dest") & filters.user(ADMIN_ID))
+        async def add_dest_cmd(client, message):
+            try:
+                link = message.command[1]
+                clean = link.replace("https://t.me/", "").replace("@", "").strip()
+
+                conn = await aiomysql.connect(**DB_CONFIG)
+                async with conn.cursor() as cur:
+                    await cur.execute("INSERT IGNORE INTO destinations (chat_link) VALUES (%s)", (clean,))
+                    await conn.commit()
+                conn.close()
+
+                await message.reply(f"✅ Destination **{clean}** added! Active immediately.")
+            except IndexError:
+                await message.reply("❌ Error. Usage: `/add_dest @link`")
+            except Exception as e:
+                await message.reply(f"❌ DB Error: {e}")
+
+        @app.on_message(filters.command("list") & filters.user(ADMIN_ID))
+        async def list_cmd(client, message):
+            srcs = await get_sources()
+            dests = await get_destinations()
+
+            text = "**📡 Sources:**\n" + "\n".join([f"• `{s}`" for s in srcs])
+            text += "\n\n**📨 Destinations:**\n" + "\n".join([f"• `{d}`" for d in dests])
+
+            await message.reply(text)
+
         @app.on_message(filters.chat(sources))
         async def handler(client, message):
 

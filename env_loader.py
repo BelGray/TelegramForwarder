@@ -11,3 +11,5 @@ DB_USER=os.getenv("DB_USER", "root")
 DB_PORT=int(os.getenv("DB_PORT", "3306"))
 DB_PASS=os.getenv("DB_PASS", "")
 DB_NAME=os.getenv("DB_NAME", "telegram_forwarder")
+
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
