@@ -48,4 +48,7 @@ async def add_account():
 
 
 if __name__ == "__main__":
-    asyncio.run(add_account())
+    try:
+        asyncio.run(add_account())
+    except KeyboardInterrupt:
+        print("Скрипт добавления сессий завершил работу. Рекомендуется перезапустить бота...")
