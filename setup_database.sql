@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS destinations (
     interval_minutes INT DEFAULT 1,
     batch_size INT DEFAULT 1,
     last_sent_at TIMESTAMP NULL DEFAULT NULL,
-    send_mode INT DEFAULT 0;
+    send_mode INT DEFAULT 0
 );
 
 -- История рассылок
