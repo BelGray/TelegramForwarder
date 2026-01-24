@@ -1,7 +1,9 @@
 import asyncio
-from collections import deque
-from pyrogram import Client, filters, compose
+import random
+from datetime import datetime, timedelta, timezone, tzinfo
+
 import aiomysql
+from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, UserDeactivated, AuthKeyUnregistered
 
 from env_loader import DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, API_ID, API_HASH, ADMIN_ID
@@ -15,260 +17,299 @@ DB_CONFIG = {
     'db': DB_NAME
 }
 
-processed_messages = deque(maxlen=1000)
-processing_lock = asyncio.Lock()
+HISTORY_LIMIT = 20
 
 
-async def get_active_sessions() -> list:
-    """Get all active user sessions (id, session, phone) from the database"""
-    res = list()
+async def execute_query(query, params=None, fetch=None):
     conn = await aiomysql.connect(**DB_CONFIG)
     async with conn.cursor() as cur:
-        await cur.execute("SELECT id, session_string, phone FROM accounts WHERE status = 'active'")
-        res = await cur.fetchall()
-    conn.close()
-    return res
-
-
-async def revive_accounts():
-    """Revive flood-waited accounts"""
-    conn = await aiomysql.connect(**DB_CONFIG)
-    async with conn.cursor() as cur:
-            await cur.execute("""
-                UPDATE accounts 
-                SET status = 'active' 
-                WHERE status = 'flood_wait' 
-                AND last_used < (NOW() - INTERVAL 30 MINUTE)
-            """)
+        await cur.execute(query, params)
+        if fetch == 'all':
+            result = await cur.fetchall()
+        elif fetch == 'one':
+            result = await cur.fetchone()
+        else:
             await conn.commit()
+            result = None
     conn.close()
+    return result
 
 
-async def get_sources() -> list:
-    """Get all source channels from the database"""
-    res = list()
-    conn = await aiomysql.connect(**DB_CONFIG)
-    async with conn.cursor() as cur:
-        await cur.execute("SELECT channel_link FROM sources")
-        res = [row[0] for row in await cur.fetchall()]
-    conn.close()
-    return res
+async def get_active_sessions():
+    return await execute_query("SELECT id, session_string, phone FROM accounts WHERE status = 'active'", fetch='all')
 
 
-async def get_destinations() -> list:
-    """Get all destination chats from the database"""
-    res = list()
-    conn = await aiomysql.connect(**DB_CONFIG)
-    async with conn.cursor() as cur:
-        await cur.execute("SELECT chat_link FROM destinations")
-        res = [row[0] for row in await cur.fetchall()]
-    conn.close()
-    return res
+async def get_sources():
+    rows = await execute_query("SELECT channel_link FROM sources", fetch='all')
+    return [row[0] for row in rows] if rows else []
+
+
+async def get_destinations_full():
+    return await execute_query("SELECT chat_link, interval_minutes, last_sent_at, batch_size, send_mode FROM destinations",
+                               fetch='all')
+
+
+async def update_last_sent_time(chat_link):
+    await execute_query("UPDATE destinations SET last_sent_at = UTC_TIMESTAMP() WHERE chat_link = %s", (chat_link,))
 
 
 async def update_account_status(phone, status):
-    """Changes account status (active -> flood_wait / banned)"""
-    try:
-        conn = await aiomysql.connect(**DB_CONFIG)
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE accounts SET status = %s WHERE phone = %s",
-                (status, phone)
-            )
-            await conn.commit()
-        conn.close()
-        logger.warning(f"Account {phone} status changed to: {status}")
-    except Exception as e:
-        logger.error(f"Status update error (phone: {phone}): {e}")
+    await execute_query("UPDATE accounts SET status = %s WHERE phone = %s", (status, phone))
 
 
 async def add_to_history(source_msg_id, account_id, status):
-    """Logs the forwarding event to the database history"""
-    try:
-        conn = await aiomysql.connect(**DB_CONFIG)
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "INSERT INTO history (source_message_id, account_id, status) VALUES (%s, %s, %s)",
-                (source_msg_id, account_id, status)
-            )
-            await conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"History logging error: {e}")
+    await execute_query("INSERT INTO history (source_message_id, account_id, status) VALUES (%s, %s, %s)",
+                        (source_msg_id, account_id, status))
 
 
-async def is_already_processed(source_msg_id):
-    """Check if message ID in history"""
-    conn = await aiomysql.connect(**DB_CONFIG)
-    async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT 1 FROM history WHERE source_message_id = %s LIMIT 1",
-            (source_msg_id,)
-        )
-        result = await cur.fetchone()
-    conn.close()
-    return result is not None
+async def revive_accounts():
+    await execute_query(
+        "UPDATE accounts SET status = 'active' WHERE status = 'flood_wait' AND last_used < (NOW() - INTERVAL 30 MINUTE)")
 
 
-async def main():
+async def run_broadcaster():
     await revive_accounts()
 
     sessions = await get_active_sessions()
     if not sessions:
-        logger.error("No active sessions found in DB! Please run add_account.py")
+        logger.error("No active sessions found!")
         return
-
-    sources = await get_sources()
-    destinations = await get_destinations()
-
-    logger.info(f"Accounts loaded: {len(sessions)} | Sources: {len(sources)} | Destinations: {len(destinations)}")
 
     clients = []
     for account_id, session_string, phone in sessions:
-        app = Client(
-            name=f"client_{phone}",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            session_string=session_string,
-            in_memory=True
-        )
-
+        app = Client(f"client_{phone}", api_id=API_ID, api_hash=API_HASH, session_string=session_string, in_memory=True)
         app.phone_number = phone
         app.account_id = account_id
         clients.append(app)
 
-    for app in clients:
+    admin_client = clients[0]
 
-        @app.on_message(filters.command("help") & filters.user(ADMIN_ID))
-        async def help_cmd(client, message):
-            text = (
-                "**ADMIN COMMANDS:**\n\n"
-                "1️⃣ **Add Source** (From where):\n"
-                "`/add_source @link`\n\n"
-                "2️⃣ **Add Destination** (Where to):\n"
-                "`/add_dest @link`\n\n"
-                "3️⃣ **Show Lists:**\n"
-                "`/list`\n\n"
-                "ℹ️ *Restart bot after adding a new source.*"
-            )
-            await message.reply(text)
+    @admin_client.on_message(filters.command("help") & filters.user(ADMIN_ID))
+    async def help_cmd(client, message):
+        text = (
+            "<b>💻 SYSTEM MANAGEMENT PANEL v2.1</b>\n\n"
+            "<b>1️⃣ SOURCES (ОТКУДА БРАТЬ)</b>\n"
+            "<code>/add_source @link</code> — Добавить канал-донор.\n\n"
+            "<b>2️⃣ DESTINATIONS (КУДА СЛАТЬ)</b>\n"
+            "<code>/add_dest @link [min] [batch]</code> — Настроить чат.\n"
+            "<i>Пример: /add_dest @chat 60 3 (раз в час по 3 поста)</i>\n\n"
+            "<b>3️⃣ SEND MODES (РЕЖИМЫ ОТПРАВКИ)</b>\n"
+            "<code>/set_mode @link [0 или 1]</code>\n"
+            "• <b>Mode 0 (Forward):</b> С кнопками, виден автор (рекомендуется).\n"
+            "• <b>Mode 1 (Copy):</b> Без кнопок, автор скрыт (для закрытых чатов).\n\n"
+            "<b>4️⃣ UTILITIES (УТИЛИТЫ)</b>\n"
+            "<code>/list</code> — Список всех чатов и их настроек.\n"
+            "<code>/delete @link</code> — Удалить чат из базы.\n"
+            "<code>/send_ad [link]</code> — Разовая рассылка поста вручную.\n\n"
+            "<b>ℹ️ INFO:</b>\n"
+            "После добавления нового <b>источника</b> перезапустите бота на сервере. "
+            "Настройки <b>получателей</b> и <b>режимов</b> применяются мгновенно."
+        )
+        await message.reply(text, parse_mode=enums.ParseMode.HTML)
 
-        @app.on_message(filters.command("add_source") & filters.user(ADMIN_ID))
-        async def add_source_cmd(client, message):
+    @admin_client.on_message(filters.command("add_source") & filters.user(ADMIN_ID))
+    async def add_source_cmd(client, message):
+        try:
+            link = message.command[1]
+            clean = link.replace("https://t.me/", "").replace("@", "").strip()
+            await execute_query("INSERT IGNORE INTO sources (channel_link) VALUES (%s)", (clean,))
+            await message.reply(f"✅ Source **{clean}** added!")
+        except:
+            await message.reply("❌ Error. Usage: `/add_source @link`")
+
+    @admin_client.on_message(filters.command("add_dest") & filters.user(ADMIN_ID))
+    async def add_dest_cmd(client, message):
+        try:
+            link = message.command[1]
+            clean = link.replace("https://t.me/", "").replace("@", "").strip()
+            interval = int(message.command[2]) if len(message.command) > 2 else 0
+            batch = int(message.command[3]) if len(message.command) > 3 else 1
+            await execute_query(
+                "INSERT INTO destinations (chat_link, interval_minutes, batch_size) VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE interval_minutes = %s, batch_size = %s",
+                (clean, interval, batch, interval, batch))
+            await message.reply(f"✅ Destination **{clean}** configured! Interval: {interval}m, Batch: {batch}")
+        except:
+            await message.reply("❌ Error. Usage: `/add_dest @link 60 3`")
+
+    @admin_client.on_message(filters.command("list") & filters.user(ADMIN_ID))
+    async def list_cmd(client, message):
+        srcs = await get_sources()
+        dests = await get_destinations_full()
+        text = "**📡 Sources:**\n" + "\n".join([f"• `{s}`" for s in srcs])
+        text += "\n\n**📨 Destinations (Interval / Batch):**\n"
+        for link, interval, _, batch in dests:
+            text += f"• `{link}` ({interval}m / {batch} posts)\n"
+        await message.reply(text)
+
+    @admin_client.on_message(filters.command("delete") & filters.user(ADMIN_ID))
+    async def delete_cmd(client, message):
+        try:
+            link = message.command[1]
+            clean = link.replace("https://t.me/", "").replace("@", "").strip()
+            await execute_query("DELETE FROM destinations WHERE chat_link = %s", (clean,))
+            await execute_query("DELETE FROM sources WHERE channel_link = %s", (clean,))
+            await message.reply(f"🗑 **{clean}** deleted from lists.")
+        except:
+            await message.reply("❌ Error. Usage: `/delete @link`")
+
+    @admin_client.on_message(filters.command("set_mode") & filters.user(ADMIN_ID))
+    async def set_mode_cmd(client, message):
+        try:
+            link = message.command[1]
+            mode = int(message.command[2])  # 0 или 1
+            clean = link.replace("https://t.me/", "").replace("@", "").strip()
+
+            await execute_query("UPDATE destinations SET send_mode = %s WHERE chat_link = %s", (mode, clean))
+            msg = "FORWARD (with buttons)" if mode == 0 else "COPY (no buttons)"
+            await message.reply(f"✅ Mode for {clean} set to: {msg}")
+        except:
+            await message.reply("❌ Usage: `/set_mode @chat 0` (Forward) or `1` (Copy)")
+
+    @admin_client.on_message(filters.command("send_ad") & filters.user(ADMIN_ID))
+    async def send_ad_cmd(client, message):
+        try:
+            link = message.command[1]
+            parts = link.split("/")
+            chat_username = parts[-2]
+            message_id = int(parts[-1])
+
+            await message.reply("🚀 Starting manual broadcast...")
+            dests = await get_destinations_full()
+
             try:
-                link = message.command[1]
-                clean = link.replace("https://t.me/", "").replace("@", "").strip()
-
-                conn = await aiomysql.connect(**DB_CONFIG)
-                async with conn.cursor() as cur:
-                    await cur.execute("INSERT IGNORE INTO sources (channel_link) VALUES (%s)", (clean,))
-                    await conn.commit()
-                conn.close()
-
-                await message.reply(f"✅ Source **{clean}** added! Restart bot to apply.")
-            except IndexError:
-                await message.reply("❌ Error. Usage: `/add_source @link`")
+                original_message = await clients[0].get_messages(chat_username, message_id)
+                if not original_message:
+                    await message.reply("❌ Error: Could not find this message.")
+                    return
             except Exception as e:
-                await message.reply(f"❌ DB Error: {e}")
-
-        @app.on_message(filters.command("add_dest") & filters.user(ADMIN_ID))
-        async def add_dest_cmd(client, message):
-            try:
-                link = message.command[1]
-                clean = link.replace("https://t.me/", "").replace("@", "").strip()
-
-                conn = await aiomysql.connect(**DB_CONFIG)
-                async with conn.cursor() as cur:
-                    await cur.execute("INSERT IGNORE INTO destinations (chat_link) VALUES (%s)", (clean,))
-                    await conn.commit()
-                conn.close()
-
-                await message.reply(f"✅ Destination **{clean}** added! Active immediately.")
-            except IndexError:
-                await message.reply("❌ Error. Usage: `/add_dest @link`")
-            except Exception as e:
-                await message.reply(f"❌ DB Error: {e}")
-
-        @app.on_message(filters.command("list") & filters.user(ADMIN_ID))
-        async def list_cmd(client, message):
-            srcs = await get_sources()
-            dests = await get_destinations()
-
-            text = "**📡 Sources:**\n" + "\n".join([f"• `{s}`" for s in srcs])
-            text += "\n\n**📨 Destinations:**\n" + "\n".join([f"• `{d}`" for d in dests])
-
-            await message.reply(text)
-
-        @app.on_message(filters.chat(sources))
-        async def handler(client, message):
-
-            if await is_already_processed(message.id):
+                await message.reply(f"❌ Error fetching original message: {e}")
                 return
 
-            unique_id = (message.chat.id, message.id)
-
-            async with processing_lock:
-                if unique_id in processed_messages:
-                    return
-                processed_messages.append(unique_id)
-
-            logger.info(f"New post {message.id} detected by {client.phone_number}")
-
-            current_destinations = await get_destinations()
-
-            for dest in current_destinations:
-                sent_successfully = False
-
-                available_clients = clients.copy()
-
-                for sender in available_clients:
-                    if sent_successfully:
-                        break
-
+            for dest_link, _, _, _, send_mode in dests:
+                sent = False
+                for sender in clients:
                     try:
-                        logger.info(f"Trying to send via {sender.phone_number}...")
+
+                        if send_mode == 1:
+                            await sender.copy_message(chat_id=dest_link, from_chat_id=chat_username, message_id=message_id)
+                            logger.info(f"AD copied to {dest_link}")
+                        else:
+                            await sender.forward_messages(chat_id=dest_link, from_chat_id=chat_username,
+                                                      message_id=message_id)
+                            logger.info(f"AD forwarded to {dest_link}")
+
+                        sent = True
+                        await asyncio.sleep(2)
+                        break
+                    except Exception as e:
+                        logger.error(f"AD send error: {e}")
+                if not sent:
+                    logger.error(f"FAILED to send AD to {dest_link}")
+            await message.reply("🏁 Manual broadcast finished.")
+        except:
+            await message.reply("❌ Error. Usage: `/send_ad https://t.me/channel/123`")
+
+    logger.info("Starting clients...")
+    for app in clients:
+        try:
+            await app.start()
+        except Exception as e:
+            logger.error(f"Failed to start {app.phone_number}: {e}")
+
+    logger.info("Broadcaster is running...")
+
+    while True:
+        try:
+            sources = await get_sources()
+            if not sources:
+                await asyncio.sleep(60)
+                continue
+
+            destinations = await get_destinations_full()
+
+            content_pool = []
+            async for post in clients[0].get_chat_history(sources[0], limit=HISTORY_LIMIT):
+                if post.reply_markup:
+                    content_pool.append(post)
+
+            if not content_pool:
+                await asyncio.sleep(60)
+                continue
+
+            for chat_link, interval, last_sent, batch_size, send_mode in destinations:
+                time_to_wait = interval if interval > 0 else 1
+
+                if last_sent:
+                    delta = datetime.now(timezone.utc) - last_sent.replace(tzinfo=timezone.utc)
+                    minutes_passed = delta.total_seconds() / 60
+
+                    if minutes_passed < time_to_wait:
+                        logger.info(f"Skip {chat_link}: passed {int(minutes_passed)}/{time_to_wait} min.")
+                        continue
+
+                logger.info(f"Time to post in {chat_link}!")
+
+                posts_to_send = random.sample(content_pool, min(batch_size, len(content_pool)))
+
+                for post in posts_to_send:
+                    sent = False
+                    for sender in clients:
+                        if sent: break
 
                         try:
-                            await sender.join_chat(dest)
-                        except Exception:
-                            logger.debug(f"Join chat warning: {e}")
+                            try:
+                                await sender.join_chat(chat_link)
+                            except:
+                                pass
 
-                        await sender.forward_messages(
-                            chat_id=dest,
-                            from_chat_id=message.chat.id,
-                            message_ids=message.id
-                        )
+                            if send_mode == 1:
+                                await sender.copy_message(
+                                    chat_id=chat_link,
+                                    from_chat_id=post.chat.id,
+                                    message_id=post.id
+                                )
+                                logger.info(f"Copied to {chat_link}")
+                            else:
+                                await sender.forward_messages(
+                                    chat_id=chat_link,
+                                    from_chat_id=post.chat.id,
+                                    message_ids=post.id
+                                )
+                                logger.info(f"Forwarded to {chat_link}")
 
-                        logger.info(f"Successfully forwarded to {dest}")
+                            logger.info(f"Post {post.id} sent to {chat_link} via {sender.phone_number}")
+                            await add_to_history(post.id, sender.account_id, 'success')
+                            sent = True
+                            await asyncio.sleep(5)
 
-                        await add_to_history(message.id, sender.account_id, 'success')
+                        except FloodWait as e:
+                            logger.warning(
+                                f"Account {sender.phone_number} got FloodWait for {e.value}s. Switching account.")
+                            await update_account_status(sender.phone_number, 'flood_wait')
 
-                        sent_successfully = True
-                        await asyncio.sleep(2)
+                        except (UserDeactivated, AuthKeyUnregistered):
+                            logger.error(f"Account {sender.phone_number} is DEAD! Removing from pool.")
+                            await update_account_status(sender.phone_number, 'banned')
+                            if sender in clients:
+                                clients.remove(sender)
 
-                    except FloodWait as e:
-                        logger.warning(f"Account {sender.phone_number} got FloodWait for {e.value}s")
-                        await update_account_status(sender.phone_number, 'flood_wait')
+                        except Exception as e:
+                            logger.error(f"Unknown error sending with {sender.phone_number}: {e}. Switching account.")
+                    if not sent:
+                        logger.critical(f"FAILED to send post {post.id} to {chat_link}")
 
-                    except (UserDeactivated, AuthKeyUnregistered):
-                        logger.error(f"Account {sender.phone_number} is DEAD (Banned/Revoked)!")
-                        await update_account_status(sender.phone_number, 'banned')
-                        if sender in clients:
-                            clients.remove(sender)
+                if posts_to_send:
+                    await update_last_sent_time(chat_link)
 
-                    except Exception as e:
-                        logger.error(f"Unknown error with {sender.phone_number}: {e}")
+        except Exception as e:
+            logger.error(f"FATAL ERROR in main loop: {e}")
 
-                if not sent_successfully:
-                    logger.critical(f"Failed to forward message to {dest} with all accounts!")
-
-
-    logger.info("Userbot farm is running...")
-    await compose(clients)
+        logger.info("Main loop finished. Sleeping for 60 seconds...")
+        await asyncio.sleep(60)
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(run_broadcaster())
     except KeyboardInterrupt:
-        print("Bot stopped.")
+        print("Broadcaster stopped.")

@@ -17,10 +17,13 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE TABLE IF NOT EXISTS destinations (
     id INT AUTO_INCREMENT PRIMARY KEY,
     chat_link VARCHAR(100) NOT NULL UNIQUE,
-    last_ad_msg_id INT DEFAULT NULL;
+    interval_minutes INT DEFAULT 1;
+    batch_size INT DEFAULT 1;
+    last_sent_at TIMESTAMP NULL DEFAULT NULL;
+    send_mode INT DEFAULT 0;
 );
 
--- История
+-- История рассылок
 CREATE TABLE IF NOT EXISTS history (
     id INT AUTO_INCREMENT PRIMARY KEY,
     source_message_id INT NOT NULL,
