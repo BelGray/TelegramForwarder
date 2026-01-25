@@ -234,6 +234,11 @@ async def run_broadcaster():
 
         try:
             if state == "WAITING_PHONE":
+
+                text = "".join([c for c in text if c.isdigit() or c == "+"])
+                if len(text) == 11 and text.startswith("8"):
+                    text = "7" + text[1:]
+
                 await message.reply("⏳ Подключаюсь к Telegram...")
 
                 new_client = Client(
