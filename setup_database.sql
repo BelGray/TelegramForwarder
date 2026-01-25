@@ -1,7 +1,7 @@
 -- Таблица аккаунтов
 CREATE TABLE IF NOT EXISTS accounts (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    phone VARCHAR(20) NOT NULL,
+    phone VARCHAR(20) NOT NULL UNIQUE,
     session_string TEXT,
     status ENUM('active', 'banned', 'flood_wait') DEFAULT 'active',
     last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP
