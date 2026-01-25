@@ -235,7 +235,7 @@ async def run_broadcaster():
         try:
             if state == "WAITING_PHONE":
 
-                text = "".join([c for c in text if c.isdigit() or c == "+"])
+                text = "".join([c for c in text if c.isdigit()])
                 if len(text) == 11 and text.startswith("8"):
                     text = "7" + text[1:]
 
