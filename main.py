@@ -1,10 +1,12 @@
 import asyncio
+import os
 import random
+import sys
 from datetime import datetime, timezone
 
 import aiomysql
 from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait, UserDeactivated, AuthKeyUnregistered
+from pyrogram.errors import FloodWait, UserDeactivated, AuthKeyUnregistered, SessionPasswordNeeded, PhoneCodeInvalid, PasswordHashInvalid
 
 from env_loader import DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, API_ID, API_HASH, ADMIN_ID
 from log_config import logger
@@ -19,6 +21,9 @@ DB_CONFIG = {
 
 HISTORY_LIMIT = 20
 
+auth_states = {}   # {user_id: "STATE"}
+temp_clients = {}  # {user_id: ClientObject}
+auth_data = {}     # {user_id: {"phone": str, "hash": str}}
 
 async def execute_query(query, params=None, fetch=None):
     conn = await aiomysql.connect(**DB_CONFIG)
@@ -34,6 +39,11 @@ async def execute_query(query, params=None, fetch=None):
     conn.close()
     return result
 
+async def save_new_account(phone, session_string):
+    await execute_query(
+        "INSERT INTO accounts (phone, session_string, status) VALUES (%s, %s, 'active')",
+        (phone, session_string)
+    )
 
 async def get_active_sessions():
     return await execute_query("SELECT id, session_string, phone FROM accounts WHERE status = 'active'", fetch='all')
@@ -98,7 +108,9 @@ async def run_broadcaster():
             "• <b>Mode 0 (Forward):</b> С кнопками, виден автор (рекомендуется).\n"
             "• <b>Mode 1 (Copy):</b> Без кнопок, автор скрыт (для закрытых чатов).\n\n"
             "<b>4️⃣ UTILITIES (УТИЛИТЫ)</b>\n"
+            "<code>/add_account</code> — Добавить сессию аккаунта в список юзер-ботов (через авторизацию).\n"
             "<code>/list</code> — Список всех чатов и их настроек.\n"
+            "<code>/restart</code> — Перезагрузить всех ботов.\n"
             "<code>/delete @link</code> — Удалить чат из базы.\n"
             "<code>/send_ad [link]</code> — Разовая рассылка поста вручную.\n\n"
             "<b>ℹ️ INFO:</b>\n"
@@ -107,13 +119,116 @@ async def run_broadcaster():
         )
         await message.reply(text, parse_mode=enums.ParseMode.HTML)
 
+    @admin_client.on_message(filters.command("restart") & filters.user(ADMIN_ID))
+    async def restart_cmd(client, message):
+        await message.reply("🔄 Перезагрузка главного обработчика и всех юзер-ботов...")
+        os.execl(sys.executable, sys.executable, *sys.argv)
+
+    @admin_client.on_message(filters.command("add_account") & filters.user(ADMIN_ID))
+    async def add_account_start(client, message):
+        user_id = message.from_user.id
+        auth_states[user_id] = "WAITING_PHONE"
+        await message.reply("📱 Введите номер телефона (с кодом страны, например +7999...):")
+
+    @admin_client.on_message(filters.text & filters.user(ADMIN_ID))
+    async def fsm_handler(client, message):
+        user_id = message.from_user.id
+        state = auth_states.get(user_id)
+
+        if not state: return
+
+        text = message.text.strip()
+
+        try:
+            if state == "WAITING_PHONE":
+                await message.reply("⏳ Подключаюсь к Telegram...")
+
+                new_client = Client(
+                    f"new_{text}",
+                    api_id=API_ID,
+                    api_hash=API_HASH,
+                    in_memory=True
+                )
+                await new_client.connect()
+
+                try:
+                    sent_code = await new_client.send_code(text)
+                except Exception as e:
+                    await message.reply(f"❌ Ошибка отправки кода: {e}")
+                    await new_client.disconnect()
+                    del auth_states[user_id]
+                    return
+
+                temp_clients[user_id] = new_client
+                auth_data[user_id] = {"phone": text, "phone_code_hash": sent_code.phone_code_hash}
+                auth_states[user_id] = "WAITING_CODE"
+
+                await message.reply("📩 Код отправлен! Введите код из Telegram (цифры):")
+
+            elif state == "WAITING_CODE":
+                new_client = temp_clients[user_id]
+                phone = auth_data[user_id]["phone"]
+                phone_code_hash = auth_data[user_id]["phone_code_hash"]
+
+                try:
+                    await new_client.sign_in(phone, phone_code_hash, text)
+
+                    session_string = await new_client.export_session_string()
+                    await save_new_account(phone, session_string)
+                    await new_client.disconnect()
+
+                    del auth_states[user_id]
+                    del temp_clients[user_id]
+                    del auth_data[user_id]
+
+                    await message.reply(f"✅ Аккаунт {phone} добавлен! Перезагружаю ботов для применения изменений... (2FA пароль для входа не требовался)")
+                    os.execl(sys.executable, sys.executable, *sys.argv)
+
+                except SessionPasswordNeeded:
+                    auth_states[user_id] = "WAITING_PASSWORD"
+                    await message.reply("🔑 Требуется 2FA пароль. Введите пароль:")
+
+                except PhoneCodeInvalid:
+                    await message.reply("❌ Неверный код. Попробуйте еще раз или начните заново /add_account")
+
+            elif state == "WAITING_PASSWORD":
+                new_client = temp_clients[user_id]
+                phone = auth_data[user_id]["phone"]
+
+                try:
+                    await new_client.check_password(text)
+
+                    session_string = await new_client.export_session_string()
+                    await save_new_account(phone, session_string)
+                    await new_client.disconnect()
+
+                    del auth_states[user_id]
+                    del temp_clients[user_id]
+                    del auth_data[user_id]
+
+                    await message.reply(f"✅ Верный 2FA пароль. Аккаунт {phone} добавлен! Перезагружаю бота для применения изменений...")
+                    os.execl(sys.executable, sys.executable, *sys.argv)
+
+                except PasswordHashInvalid:
+                    await message.reply("❌ Неверный пароль. Попробуйте еще раз.")
+
+        except Exception as e:
+            logger.error(f"Auth FSM Error: {e}")
+            await message.reply(f"❌ Произошла ошибка: {e}\nАвторизация отменена.")
+
+            if user_id in temp_clients:
+                await temp_clients[user_id].disconnect()
+                del temp_clients[user_id]
+            if user_id in auth_states:
+                del auth_states[user_id]
+
     @admin_client.on_message(filters.command("add_source") & filters.user(ADMIN_ID))
     async def add_source_cmd(client, message):
         try:
             link = message.command[1]
             clean = link.replace("https://t.me/", "").replace("@", "").strip()
             await execute_query("INSERT IGNORE INTO sources (channel_link) VALUES (%s)", (clean,))
-            await message.reply(f"✅ Source **{clean}** added!")
+            await message.reply(f"✅ Source **{clean}** added (добавлен канал-вещатель)! Рекомендуется перезагрузить юзер-ботов для применения изменений (воспользуйтесь командой `/restart`)")
         except:
             await message.reply("❌ Error. Usage: `/add_source @link`")
 
@@ -175,15 +290,6 @@ async def run_broadcaster():
 
             await message.reply("🚀 Starting manual broadcast...")
             dests = await get_destinations_full()
-
-            try:
-                original_message = await clients[0].get_messages(chat_username, message_id)
-                if not original_message:
-                    await message.reply("❌ Error: Could not find this message.")
-                    return
-            except Exception as e:
-                await message.reply(f"❌ Error fetching original message: {e}")
-                return
 
             for dest_link, _, _, _, send_mode in dests:
                 sent = False
