@@ -55,9 +55,13 @@ async def get_sources():
 
 
 async def get_destinations_full():
-    return await execute_query("SELECT chat_link, interval_minutes, last_sent_at, batch_size, send_mode FROM destinations",
-                               fetch='all')
+    return await execute_query("SELECT chat_link, interval_minutes, last_sent_at, batch_size, send_mode, last_msg_id FROM destinations", fetch='all')
 
+async def update_last_msg_id(chat_link, msg_id):
+    await execute_query(
+        "UPDATE destinations SET last_msg_id = %s, last_sent_at = UTC_TIMESTAMP() WHERE chat_link = %s",
+        (msg_id, chat_link)
+    )
 
 async def update_last_sent_time(chat_link):
     await execute_query("UPDATE destinations SET last_sent_at = UTC_TIMESTAMP() WHERE chat_link = %s", (chat_link,))
@@ -160,7 +164,7 @@ async def run_broadcaster():
         dests = await get_destinations_full()
         text = "**📡 Sources:**\n" + "\n".join([f"• `{s}`" for s in srcs])
         text += "\n\n**📨 Destinations (Interval / Batch / Mode):**\n"
-        for link, interval, _, batch, mode in dests:
+        for link, interval, _, batch, mode, _ in dests:
             text += f"• `{link}` (`{interval}` min / `{batch}` posts / `{mode}`)\n"
         await message.reply(text)
 
@@ -338,18 +342,22 @@ async def run_broadcaster():
                 await asyncio.sleep(60)
                 continue
 
-            destinations = await get_destinations_full()
-
             content_pool = []
-            async for post in clients[0].get_chat_history(sources[0], limit=HISTORY_LIMIT):
-                if post.reply_markup:
-                    content_pool.append(post)
+            try:
+                async for post in clients[0].get_chat_history(sources[0], limit=HISTORY_LIMIT):
+                    if post.reply_markup:
+                        content_pool.append(post)
+            except Exception as e:
+                logger.error(f"Error fetching history: {e}")
 
             if not content_pool:
+                logger.warning("No valid content found. Waiting...")
                 await asyncio.sleep(60)
                 continue
 
-            for chat_link, interval, last_sent, batch_size, send_mode in destinations:
+            destinations = await get_destinations_full()
+
+            for chat_link, interval, last_sent, batch_size, send_mode, last_msg_id in destinations:
                 time_to_wait = interval if interval > 0 else 1
 
                 if last_sent:
@@ -361,6 +369,15 @@ async def run_broadcaster():
                         continue
 
                 logger.info(f"Time to post in {chat_link}!")
+
+                if last_msg_id:
+                    for deleter in clients:
+                        try:
+                            await deleter.delete_messages(chat_link, last_msg_id)
+                            logger.info(f"🗑 Deleted old msg {last_msg_id} in {chat_link}")
+                            break
+                        except Exception:
+                            pass
 
                 posts_to_send = random.sample(content_pool, min(batch_size, len(content_pool)))
 
@@ -375,23 +392,27 @@ async def run_broadcaster():
                             except:
                                 pass
 
+                            sent_msg = None
+
                             if send_mode == 1:
-                                await sender.copy_message(
+                                sent_msg = await sender.copy_message(
                                     chat_id=chat_link,
                                     from_chat_id=post.chat.id,
                                     message_id=post.id
                                 )
                                 logger.info(f"Copied to {chat_link}")
                             else:
-                                await sender.forward_messages(
+                                sent_msg = await sender.forward_messages(
                                     chat_id=chat_link,
                                     from_chat_id=post.chat.id,
                                     message_ids=post.id
                                 )
                                 logger.info(f"Forwarded to {chat_link}")
 
+                            if sent_msg:
+                                await update_last_msg_id(chat_link, sent_msg.id)
+                                await add_to_history(post.id, sender.account_id, 'success')
                             logger.info(f"Post {post.id} sent to {chat_link} via {sender.phone_number}")
-                            await add_to_history(post.id, sender.account_id, 'success')
                             sent = True
                             await asyncio.sleep(5)
 
