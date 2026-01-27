@@ -162,10 +162,10 @@ async def run_broadcaster():
     async def list_cmd(client, message):
         srcs = await get_sources()
         dests = await get_destinations_full()
-        text = "**📡 Sources:**\n" + "\n".join([f"• `{s}`" for s in srcs])
+        text = "**📡 Sources:**\n" + "\n".join([f"• @{s}" for s in srcs])
         text += "\n\n**📨 Destinations (Interval / Batch / Mode):**\n"
         for link, interval, _, batch, mode, _ in dests:
-            text += f"• `{link}` (`{interval}` min / `{batch}` posts / `{mode}`)\n"
+            text += f"• @{link} (`{interval}` min / `{batch}` posts / `{mode}`)\n"
         await message.reply(text)
 
     @admin_client.on_message(filters.command("delete") & filters.user(ADMIN_ID))
