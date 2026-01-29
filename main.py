@@ -370,14 +370,14 @@ async def run_broadcaster():
 
                 logger.info(f"Time to post in {chat_link}!")
 
-                if last_msg_id:
-                    for deleter in clients:
-                        try:
-                            await deleter.delete_messages(chat_link, last_msg_id)
-                            logger.info(f"🗑 Deleted old msg {last_msg_id} in {chat_link}")
-                            break
-                        except Exception:
-                            pass
+                # if last_msg_id:
+                #     for deleter in clients:
+                #         try:
+                #             await deleter.delete_messages(chat_link, last_msg_id)
+                #             logger.info(f"🗑 Deleted old msg {last_msg_id} in {chat_link}")
+                #             break
+                #         except Exception:
+                #             pass
 
                 posts_to_send = random.sample(content_pool, min(batch_size, len(content_pool)))
 
